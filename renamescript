@@ -19,10 +19,10 @@ col_site     <- "Site"                        # site column
 col_date     <- "Date"                        # date column (various formats ok)
 col_time     <- "Time"                        # time column (optional; various formats ok)
 dry_run      <- TRUE                          # TRUE = preview only; FALSE = actually rename
-timezone_str <- "America/Toronto"             # used if we need to construct datetimes
+timezone_str <- "America/Edmonton"           # used if we need to construct datetimes (can change this to something like "America/Regina" if you need Saskatchewan for your work!!!! 
 # -----------------------------------
 
-# Helper: keep safe characters for filenames (Windows-safe)
+# Helper: keep safe characters for filenames, don't lose any info here! 
 sanitize <- function(x) {
   x %>%
     str_replace_all("[\\/:*?\"<>|]", "_") %>% # Windows reserved
@@ -32,7 +32,7 @@ sanitize <- function(x) {
     coalesce("NA")
 }
 
-# Helper: parse date/time flexibly
+# Helper: parse date/time flexibly if you put it in mdy or ymd or whatever you may have done 
 parse_dt <- function(date_col, time_col = NULL, tz = "UTC") {
   # Accept common date formats
   d <- suppressWarnings(parse_date_time(date_col,
@@ -125,7 +125,7 @@ issues <- list(
   collisions     = collisions
 )
 
-# Report
+# Report......... aka check that it HOPEFULLY worked properly
 cat("\n===== RENAME PREVIEW =====\n")
 cat("Directory: ", dir_wav, "\n")
 cat("Total rows in CSV: ", nrow(map), "\n")
@@ -139,7 +139,7 @@ preview <- plan %>%
             exists = .exists, parsed_datetime = .dt_ok)
 print(head(preview, 15))
 
-# Write a log (for audit/undo)
+# Write a log (for audit/undo) --- good in case you made a mistake or... blame it on the computer for making the mistake
 timestamp_tag <- format(Sys.time(), "%Y%m%d_%H%M%S")
 log_path <- path(dir_wav, paste0("rename_log_", timestamp_tag, ".csv"))
 write_csv(plan %>%
@@ -172,7 +172,7 @@ if (dry_run) {
   cat("Done.\n")
 }
 
-# ----- OPTIONAL: UNDO FUNCTION -----
+# !!!!!!!!!!!!----- OPTIONAL: UNDO FUNCTION ----- !!!!!!!!!!!!
 # If you need to undo, run this snippet afterward, pointing to the log you just wrote:
 # log_path <- "C:/path/to/wavs/rename_log_YYYYMMDD_HHMMSS.csv"
 # log_df <- readr::read_csv(log_path, show_col_types = FALSE)

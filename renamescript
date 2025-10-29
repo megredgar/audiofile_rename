@@ -1,0 +1,180 @@
+# rename_wavs_from_csv.R
+# Renames .wav files using a CSV with columns mapping each file to Site/Date/Time.
+# New name format: <Site>_<YYYYMMDD>_<HHMMSS>.wav
+# Safe by default (dry run). Creates a log for undo.
+
+suppressPackageStartupMessages({
+  library(readr)
+  library(dplyr)
+  library(stringr)
+  library(lubridate)
+  library(fs)
+})
+
+# ---------- USER SETTINGS ----------
+dir_wav      <- "C:/path/to/wavs"            # folder containing .wav files
+path_csv     <- "C:/path/to/map.csv"         # CSV mapping file
+col_file     <- "filename"                    # column in CSV with current .wav filename (with or without .wav)
+col_site     <- "Site"                        # site column
+col_date     <- "Date"                        # date column (various formats ok)
+col_time     <- "Time"                        # time column (optional; various formats ok)
+dry_run      <- TRUE                          # TRUE = preview only; FALSE = actually rename
+timezone_str <- "America/Toronto"             # used if we need to construct datetimes
+# -----------------------------------
+
+# Helper: keep safe characters for filenames (Windows-safe)
+sanitize <- function(x) {
+  x %>%
+    str_replace_all("[\\/:*?\"<>|]", "_") %>% # Windows reserved
+    str_replace_all("[^A-Za-z0-9._-]+", "_") %>%
+    str_trim("_") %>%
+    na_if("") %>%
+    coalesce("NA")
+}
+
+# Helper: parse date/time flexibly
+parse_dt <- function(date_col, time_col = NULL, tz = "UTC") {
+  # Accept common date formats
+  d <- suppressWarnings(parse_date_time(date_col,
+                                        orders = c("Ymd", "dmY", "mdY", "Y-m-d", "d/m/Y", "m/d/Y", "Y.m.d"),
+                                        tz = tz, quiet = TRUE))
+  # If time provided, parse it too
+  if (!is.null(time_col)) {
+    t <- suppressWarnings(parse_date_time(time_col,
+                                          orders = c("HMS", "HM", "H:M:S", "H:M", "I:M p", "I:M:S p"),
+                                          tz = tz, quiet = TRUE))
+    # Combine date and time if both parsed
+    if (!all(is.na(d)) & !all(is.na(t))) {
+      # Transfer time components from t to d
+      d <- make_datetime(year(d), month(d), day(d),
+                         hour(t %||% 0), minute(t %||% 0), second(t %||% 0),
+                         tz = tz)
+    }
+  }
+  d
+}
+
+`%||%` <- function(a, b) if (is.null(a)) b else a
+
+# Read mapping
+stopifnot(dir_exists(dir_wav))
+stopifnot(file_exists(path_csv))
+
+map_raw <- suppressMessages(read_csv(path_csv, show_col_types = FALSE))
+
+# Basic checks for required columns
+required <- c(col_file, col_site, col_date)
+missing_cols <- setdiff(required, names(map_raw))
+if (length(missing_cols)) {
+  stop("CSV is missing required column(s): ", paste(missing_cols, collapse = ", "))
+}
+
+# Normalize current filenames
+map <- map_raw %>%
+  mutate(
+    .orig_file = !!sym(col_file) %>% as.character(),
+    .orig_file = if_else(!str_detect(.orig_file, regex("\\.wav$", ignore_case = TRUE)),
+                         paste0(.orig_file, ".wav"),
+                         .orig_file),
+    .site      = sanitize(!!sym(col_site)),
+    .date_raw  = as.character(!!sym(col_date)),
+    .time_raw  = if (col_time %in% names(.)) as.character(!!sym(col_time)) else NA_character_
+  )
+
+# Parse datetime (timezone for consistency; filenames are local)
+dt <- parse_dt(map$.date_raw, map$.time_raw, tz = timezone_str)
+map <- map %>% mutate(.dt = dt)
+
+# Format new name parts
+map <- map %>%
+  mutate(
+    .yyyymmdd = if_else(!is.na(.dt), format(with_tz(.dt, timezone_str), "%Y%m%d"), NA_character_),
+    .hhmmss   = if_else(!is.na(.dt), format(with_tz(.dt, timezone_str), "%H%M%S"), NA_character_),
+    .dt_ok    = !is.na(.yyyymmdd),
+    .new_file = if_else(.dt_ok,
+                        paste0(.site, "_", .yyyymmdd, "_", coalesce(.hhmmss, "000000"), ".wav"),
+                        paste0(.site, "_DATE_ERR_", row_number(), ".wav"))
+  )
+
+# Join to filesystem and check presence
+files_now <- dir_ls(dir_wav, type = "file", glob = "*.wav", recurse = FALSE)
+df_fs <- tibble(.orig_file = path_file(files_now), .orig_path = files_now)
+
+plan <- map %>%
+  left_join(df_fs, by = ".orig_file") %>%
+  mutate(
+    .exists     = !is.na(.orig_path),
+    .new_path   = path(dir_wav, .new_file)
+  )
+
+# Detect duplicates in targets
+dup_targets <- plan %>%
+  count(.new_file) %>%
+  filter(n > 1)
+
+# Detect collisions with existing files not in mapping
+collisions <- plan %>%
+  filter(.exists) %>%
+  filter(file_exists(.new_path) & !str_equal(.new_path, .orig_path))
+
+# Summarize issues
+issues <- list(
+  missing_source = plan %>% filter(!.exists),
+  bad_datetime   = plan %>% filter(!.dt_ok),
+  duplicate_targets = dup_targets,
+  collisions     = collisions
+)
+
+# Report
+cat("\n===== RENAME PREVIEW =====\n")
+cat("Directory: ", dir_wav, "\n")
+cat("Total rows in CSV: ", nrow(map), "\n")
+cat("Files found in folder: ", sum(plan$.exists), "/", nrow(plan), "\n")
+cat("Bad/Unparsed dates: ", nrow(issues$bad_datetime), "\n")
+cat("Duplicate target names: ", nrow(issues$duplicate_targets), "\n")
+cat("Target name collisions with existing files: ", nrow(issues$collisions), "\n\n")
+
+preview <- plan %>%
+  transmute(from = .orig_file, to = path_file(.new_path),
+            exists = .exists, parsed_datetime = .dt_ok)
+print(head(preview, 15))
+
+# Write a log (for audit/undo)
+timestamp_tag <- format(Sys.time(), "%Y%m%d_%H%M%S")
+log_path <- path(dir_wav, paste0("rename_log_", timestamp_tag, ".csv"))
+write_csv(plan %>%
+            select(.orig_file, .orig_path, .new_file, .new_path, .site, .date_raw, .time_raw, .dt, .dt_ok),
+          log_path)
+cat("\nLog written to: ", log_path, "\n")
+
+# Hard stops if dangerous
+if (nrow(issues$duplicate_targets) > 0) {
+  stop("Aborting: duplicate target filenames detected. Fix CSV or add uniqueness (e.g., recorder ID).")
+}
+if (nrow(issues$collisions) > 0) {
+  stop("Aborting: target filenames already exist in the folder (collision). Investigate before renaming.")
+}
+
+# Perform the rename
+if (dry_run) {
+  cat("\nDRY RUN: No files renamed. Set dry_run <- FALSE to apply changes.\n")
+} else {
+  # Only rename rows where the source exists
+  to_do <- plan %>% filter(.exists)
+  ok <- file_move(to_do$.orig_path, to_do$.new_path)
+  n_ok <- sum(ok)
+  n_fail <- sum(!ok)
+  cat("\nRenamed: ", n_ok, " files. Failed: ", n_fail, ".\n")
+  if (n_fail) {
+    cat("Failures (first few):\n")
+    print(to_do %>% filter(!ok) %>% select(.orig_path, .new_path) %>% head())
+  }
+  cat("Done.\n")
+}
+
+# ----- OPTIONAL: UNDO FUNCTION -----
+# If you need to undo, run this snippet afterward, pointing to the log you just wrote:
+# log_path <- "C:/path/to/wavs/rename_log_YYYYMMDD_HHMMSS.csv"
+# log_df <- readr::read_csv(log_path, show_col_types = FALSE)
+# exists_now <- fs::file_exists(log_df$.new_path)
+# fs::file_move(log_df$.new_path[exists_now], log_df$.orig_path[exists_now])
